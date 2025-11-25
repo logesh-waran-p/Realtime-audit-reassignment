@@ -5,298 +5,486 @@ import os
 import math
 import traceback
 from datetime import datetime
+import time
 
 # ==================== CONFIGURATION ====================
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 
-# Initialize OpenAI client
+# Initialize OpenAI client with better error handling
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
+client = None
+openai_error = None
+
 if OPENAI_API_KEY:
-    client = OpenAI(api_key=OPENAI_API_KEY)
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        print(f"🔑 API Key configured: {OPENAI_API_KEY[:12]}...")
+        
+        # Test the connection immediately
+        try:
+            test_response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": "test"}],
+                max_tokens=5,
+                timeout=10.0
+            )
+            print("✅ OpenAI API connection test SUCCESSFUL")
+        except Exception as test_error:
+            print(f"⚠️ OpenAI API connection test FAILED: {test_error}")
+            openai_error = str(test_error)
+            client = None
+    except Exception as e:
+        print(f"❌ Failed to initialize OpenAI client: {e}")
+        openai_error = str(e)
+        client = None
 else:
-    client = None
-    print("⚠️  WARNING: OPENAI_API_KEY not set. AI features will be disabled.")
+    print("⚠️ WARNING: OPENAI_API_KEY not set. AI features will be disabled.")
+    openai_error = "API key not configured"
 
 # Constants
 AUDITOR_CAPACITY_HOURS = 40.0
 HOURS_PER_STORE_AUDIT = 4.0
-MAX_STORES_PER_AUDITOR = 1  # ONE AUDITOR = ONE STORE ONLY
+MAX_STORES_PER_AUDITOR = 1
 
 # ==================== UTILITY FUNCTIONS ====================
 
 def calculate_distance(lat1, lon1, lat2, lon2):
-    """Calculate Haversine distance."""
-    R = 6371
+    """Calculate distance between two points using Haversine formula."""
+    R = 6371  # Earth's radius in kilometers
+
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
-    a = (math.sin(dlat / 2)**2 +
-         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) *
-         math.sin(dlon / 2)**2)
+
+    a = (math.sin(dlat / 2) ** 2 + 
+         math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * 
+         math.sin(dlon / 2) ** 2)
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
     return R * c
 
-
 def validate_request_data(data):
-    """Validate input structure."""
+    """Validate incoming request data."""
     if not data:
         return False, "Request body is empty"
+
     if 'auditors' not in data:
-        return False, "Missing 'auditors'"
+        return False, "Missing 'auditors' field in request"
+
     if 'stores' not in data:
-        return False, "Missing 'stores'"
+        return False, "Missing 'stores' field in request"
 
     if not isinstance(data['auditors'], list):
         return False, "'auditors' must be a list"
+
     if not isinstance(data['stores'], list):
         return False, "'stores' must be a list"
 
     if len(data['auditors']) == 0:
-        return False, "Auditors list empty"
+        return False, "Auditors list is empty"
+
     if len(data['stores']) == 0:
-        return False, "Stores list empty"
+        return False, "Stores list is empty"
 
-    # Validate fields
-    for auditor in data['auditors']:
-        for field in ['auditor_id', 'latitude', 'longitude', 'availability_status']:
+    # Validate auditor fields
+    for i, auditor in enumerate(data['auditors']):
+        required_fields = ['auditor_id', 'latitude', 'longitude', 'availability_status']
+        for field in required_fields:
             if field not in auditor:
-                return False, f"Auditor missing field: {field}"
+                return False, f"Auditor at index {i} missing required field: {field}"
 
-    for store in data['stores']:
-        for field in ['store_id', 'latitude', 'longitude', 'store_status']:
+    # Validate store fields
+    for i, store in enumerate(data['stores']):
+        required_fields = ['store_id', 'latitude', 'longitude', 'store_status']
+        for field in required_fields:
             if field not in store:
-                return False, f"Store missing field: {field}"
+                return False, f"Store at index {i} missing required field: {field}"
 
     return True, None
 
-
-# ==================== OPENAI ALGORITHM (FIXED) ====================
+# ==================== ASSIGNMENT ALGORITHMS ====================
 
 def assign_with_openai(auditors, stores):
-    """Use GPT-4.1 to assign auditors to stores (1:1 only)."""
-
+    """
+    Use OpenAI to intelligently assign auditors to stores.
+    RULE: One auditor can only be assigned to ONE store.
+    """
     if not client:
-        raise Exception("OpenAI API key missing.")
+        raise Exception(f"OpenAI client not available. Reason: {openai_error}")
 
-    prompt = f"""
-You are an auditor assignment engine. Follow 1:1 rule strictly.
+    # Simplify data
+    simplified_auditors = [
+        {
+            "id": a['auditor_id'],
+            "lat": round(a['latitude'], 4),
+            "lon": round(a['longitude'], 4),
+            "status": a['availability_status']
+        }
+        for a in auditors
+    ]
+    
+    simplified_stores = [
+        {
+            "id": s['store_id'],
+            "lat": round(s['latitude'], 4),
+            "lon": round(s['longitude'], 4)
+        }
+        for s in stores
+    ]
 
-AUDITORS:
-{json.dumps(auditors, indent=2)}
+    prompt = f"""Assign auditors to stores with these rules:
 
-STORES:
-{json.dumps(stores, indent=2)}
+AUDITORS: {json.dumps(simplified_auditors)}
+STORES: {json.dumps(simplified_stores)}
 
-RULES:
-1. Each auditor can be assigned to only ONE store (strict 1:1)
-2. Use only auditors with availability_status = "Available"
-3. Choose the nearest available auditor for each store
-4. JSON output only. No markdown.
+Rules:
+1. Each auditor assigned to ONLY ONE store
+2. Only use auditors with status="Available"
+3. Minimize travel distance
+4. Unassigned stores get null
 
-OUTPUT FORMAT:
+Return JSON:
 {{
   "assignments": [
-    {{
-      "store_id": 1,
-      "assigned_auditor_id": 3,
-      "distance_km": 12.5,
-      "reason": "Nearest available"
-    }}
+    {{"store_id": 1, "assigned_auditor_id": 2, "distance_km": 15.3, "reason": "Nearest"}},
+    {{"store_id": 3, "assigned_auditor_id": null, "distance_km": null, "reason": "No auditors"}}
   ]
-}}
-"""
-
-    print("📡 Calling OpenAI responses.create() ...")
+}}"""
 
     try:
-        response = client.responses.create(
-            model="gpt-4.1",
-            input=[
-                {"role": "system", "content": "You output STRICT JSON."},
+        print("📡 Calling OpenAI API...")
+
+        response = client.chat.completions.create(
+            model="gpt-3.5-turbo",  # Using more reliable model
+            messages=[
+                {"role": "system", "content": "Output valid JSON only for one-to-one assignments. No markdown."},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            temperature=0.1,
+            max_tokens=1500,
+            timeout=30.0  # 30 second timeout
         )
 
-        ai_response = response.output_text
-        ai_response = ai_response.strip()
+        ai_response = response.choices[0].message.content.strip()
+        print(f"📥 Received AI response ({len(ai_response)} chars)")
 
-        # Clean code blocks if any
-        if ai_response.startswith("```"):
-            ai_response = ai_response.split("```")[1].strip()
+        # Clean markdown
+        if "```json" in ai_response:
+            ai_response = ai_response.split("```json")[1].split("```")[0].strip()
+        elif "```" in ai_response:
+            ai_response = ai_response.split("```")[1].split("```")[0].strip()
 
         result = json.loads(ai_response)
 
-        # Validate strict 1:1
-        used = set()
-        for a in result.get("assignments", []):
-            aid = a.get("assigned_auditor_id")
-            if aid:
-                if aid in used:
-                    raise Exception("Duplicate auditor assignment detected.")
-                used.add(aid)
+        if 'assignments' not in result:
+            raise Exception("Missing 'assignments' in response")
 
+        # Enforce one-to-one constraint
+        assigned_auditors = set()
+        valid_assignments = []
+        
+        for assignment in result['assignments']:
+            if 'store_id' not in assignment:
+                continue
+                
+            auditor_id = assignment.get('assigned_auditor_id')
+            
+            if auditor_id and auditor_id in assigned_auditors:
+                print(f"⚠️ Duplicate auditor {auditor_id}, fixing...")
+                assignment['assigned_auditor_id'] = None
+                assignment['distance_km'] = None
+                assignment['reason'] = "Auditor already assigned"
+            
+            if auditor_id:
+                assigned_auditors.add(auditor_id)
+            
+            valid_assignments.append(assignment)
+
+        # Add missing stores
+        store_ids_in_response = {a['store_id'] for a in valid_assignments}
+        for store in stores:
+            if store['store_id'] not in store_ids_in_response:
+                valid_assignments.append({
+                    "store_id": store['store_id'],
+                    "assigned_auditor_id": None,
+                    "distance_km": None,
+                    "reason": "Not in AI response"
+                })
+
+        result['assignments'] = valid_assignments
+        assigned_count = len([a for a in valid_assignments if a['assigned_auditor_id']])
+
+        print(f"✅ AI assignment: {assigned_count}/{len(stores)} stores assigned")
         return result
 
     except Exception as e:
-        print("❌ OpenAI Error:", str(e))
+        print(f"❌ OpenAI error: {type(e).__name__}: {str(e)}")
         raise
 
-
-# ==================== GREEDY FALLBACK ====================
-
 def assign_with_greedy_algorithm(auditors, stores):
-    print("🔄 Using greedy fallback...")
+    """
+    Greedy algorithm: assigns each store to nearest available auditor.
+    RULE: Each auditor can only be assigned to ONE store.
+    """
+    print("🔄 Using greedy algorithm (one-to-one)...")
 
     assignments = []
-    assigned = set()
+    assigned_auditors = set()
+
+    # Filter available auditors
+    available_auditors = [a for a in auditors if a['availability_status'] == 'Available']
+    print(f"   Available auditors: {len(available_auditors)}/{len(auditors)}")
+
+    if len(available_auditors) == 0:
+        print("   ⚠️ No available auditors!")
+        for store in stores:
+            assignments.append({
+                "store_id": store['store_id'],
+                "assigned_auditor_id": None,
+                "distance_km": None,
+                "reason": "No auditors available"
+            })
+        return {"assignments": assignments}
+
+    # Calculate distances for each store
+    store_distance_pairs = []
 
     for store in stores:
-        nearest = None
-        nearest_dist = float("inf")
-
-        for auditor in auditors:
-            if auditor['availability_status'] != "Available":
-                continue
-            if auditor['auditor_id'] in assigned:
-                continue
-
-            d = calculate_distance(
+        distances = []
+        for auditor in available_auditors:
+            distance = calculate_distance(
                 store['latitude'], store['longitude'],
                 auditor['latitude'], auditor['longitude']
             )
+            distances.append((auditor['auditor_id'], distance))
 
-            if d < nearest_dist:
-                nearest_dist = d
-                nearest = auditor
+        distances.sort(key=lambda x: x[1])
+        store_distance_pairs.append((store, distances))
 
-        if nearest:
-            assigned.add(nearest['auditor_id'])
+    # Sort stores by minimum distance
+    store_distance_pairs.sort(key=lambda x: x[1][0][1] if x[1] else float('inf'))
+
+    # Assign stores to nearest available auditors
+    for store, sorted_auditors in store_distance_pairs:
+        assigned = False
+
+        for auditor_id, distance in sorted_auditors:
+            if auditor_id not in assigned_auditors:
+                assigned_auditors.add(auditor_id)
+                assignments.append({
+                    "store_id": store['store_id'],
+                    "assigned_auditor_id": auditor_id,
+                    "distance_km": round(distance, 2),
+                    "reason": "Nearest available auditor"
+                })
+                assigned = True
+                print(f"  ✓ Store {store['store_id']} → Auditor {auditor_id} ({round(distance, 2)} km)")
+                break
+
+        if not assigned:
             assignments.append({
-                "store_id": store["store_id"],
-                "assigned_auditor_id": nearest["auditor_id"],
-                "distance_km": round(nearest_dist, 2),
-                "reason": "Nearest available auditor"
-            })
-        else:
-            assignments.append({
-                "store_id": store["store_id"],
+                "store_id": store['store_id'],
                 "assigned_auditor_id": None,
                 "distance_km": None,
-                "reason": "No auditor available"
+                "reason": "All auditors assigned"
             })
+            print(f"  ✗ Store {store['store_id']} → No auditor available")
 
+    assigned_count = len([a for a in assignments if a['assigned_auditor_id']])
+    print(f"✅ Greedy assignment completed: {assigned_count}/{len(stores)} stores assigned")
     return {"assignments": assignments}
 
-
 def perform_assignment(auditors, stores, use_ai=True):
-    if use_ai and client:
-        try:
-            return assign_with_openai(auditors, stores)
-        except Exception:
-            print("⚠️ Falling back to greedy algorithm.")
-    return assign_with_greedy_algorithm(auditors, stores)
+    """
+    Main assignment orchestrator.
+    Always has greedy fallback if AI fails.
+    """
+    # Skip AI if not available
+    if not use_ai or not client:
+        if not client:
+            print(f"⚠️ AI disabled: {openai_error}")
+        return assign_with_greedy_algorithm(auditors, stores)
 
+    # Try AI with fallback
+    try:
+        return assign_with_openai(auditors, stores)
+    except Exception as e:
+        print(f"⚠️ AI assignment failed: {e}")
+        print("⚠️ Falling back to greedy algorithm...")
+        return assign_with_greedy_algorithm(auditors, stores)
 
-# ==================== RESPONSE BUILDER ====================
+# ==================== RESPONSE FORMATTING ====================
 
 def format_spring_boot_response(auditors, stores, assignments):
-    auditor_to_store = {}
+    """Format response for Spring Boot."""
+    auditor_to_stores = {}
     store_to_auditor = {}
 
-    # Build mappings
-    for a in assignments["assignments"]:
-        sid = a["store_id"]
-        aid = a["assigned_auditor_id"]
-        store_to_auditor[sid] = aid
-        if aid:
-            auditor_to_store[aid] = [sid]
+    for assignment in assignments['assignments']:
+        store_id = assignment['store_id']
+        auditor_id = assignment['assigned_auditor_id']
 
+        store_to_auditor[store_id] = auditor_id
+
+        if auditor_id:
+            if auditor_id not in auditor_to_stores:
+                auditor_to_stores[auditor_id] = []
+            auditor_to_stores[auditor_id].append(store_id)
+
+    # Format auditors
     formatted_auditors = []
-    for a in auditors:
-        aid = a["auditor_id"]
-        assigned = auditor_to_store.get(aid, [])
-        hours = len(assigned) * HOURS_PER_STORE_AUDIT
+    for auditor in auditors:
+        auditor_id = auditor['auditor_id']
+        assigned_store_ids = auditor_to_stores.get(auditor_id, [])
+        current_hours = len(assigned_store_ids) * HOURS_PER_STORE_AUDIT
 
         formatted_auditors.append({
-            "auditor_id": aid,
-            "latitude": a["latitude"],
-            "longitude": a["longitude"],
-            "availability_status": a["availability_status"],
+            "auditor_id": auditor_id,
+            "latitude": auditor['latitude'],
+            "longitude": auditor['longitude'],
+            "availability_status": auditor['availability_status'],
             "workloadCapacityHours": AUDITOR_CAPACITY_HOURS,
-            "currentAssignedHours": hours,
-            "remaining_hours": AUDITOR_CAPACITY_HOURS - hours,
-            "assigned_store_ids": assigned,
-            "raw": a
+            "currentAssignedHours": current_hours,
+            "remaining_hours": AUDITOR_CAPACITY_HOURS - current_hours,
+            "assigned_store_ids": assigned_store_ids,
+            "raw": auditor
         })
 
+    # Format stores
     formatted_stores = []
-    for s in stores:
-        sid = s["store_id"]
+    for store in stores:
+        store_id = store['store_id']
+        assigned_auditor_id = store_to_auditor.get(store_id)
+
         formatted_stores.append({
-            "store_id": sid,
-            "latitude": s["latitude"],
-            "longitude": s["longitude"],
-            "store_status": s["store_status"],
-            "assigned_auditor_id": store_to_auditor.get(sid),
-            "raw": s
+            "store_id": store_id,
+            "latitude": store['latitude'],
+            "longitude": store['longitude'],
+            "store_status": store['store_status'],
+            "assigned_auditor_id": assigned_auditor_id,
+            "raw": store
         })
+
+    # Statistics
+    total_assigned = len([s for s in formatted_stores if s['assigned_auditor_id']])
+    total_unassigned = len(formatted_stores) - total_assigned
+    auditors_used = len([a for a in formatted_auditors if a['assigned_store_ids']])
 
     return {
         "status": "success",
         "code": "SUCCESS",
+        "message": f"Assigned {total_assigned}/{len(stores)} stores using {auditors_used}/{len(auditors)} auditors",
+        "summary": {
+            "total_stores": len(stores),
+            "stores_assigned": total_assigned,
+            "stores_unassigned": total_unassigned,
+            "total_auditors": len(auditors),
+            "auditors_used": auditors_used,
+            "auditors_available": len([a for a in auditors if a['availability_status'] == 'Available'])
+        },
         "data": {
             "auditors": formatted_auditors,
             "stores": formatted_stores
         }
     }
 
-
 # ==================== API ENDPOINTS ====================
 
 @app.route('/api/process-assignments', methods=['POST'])
 def assign_auditors():
+    """Main assignment endpoint."""
     try:
         data = request.get_json()
-        valid, error = validate_request_data(data)
-        if not valid:
-            return jsonify({"status": "error", "message": error}), 400
 
-        auditors = data["auditors"]
-        stores = data["stores"]
+        print("=" * 60)
+        print(f"📥 RECEIVED REQUEST - {datetime.now().strftime('%H:%M:%S')}")
+        print("=" * 60)
 
-        assignments = perform_assignment(auditors, stores)
+        # Validate
+        is_valid, error_message = validate_request_data(data)
+        if not is_valid:
+            print(f"❌ Validation failed: {error_message}")
+            return jsonify({
+                "status": "error",
+                "code": "INVALID_REQUEST",
+                "message": error_message
+            }), 400
 
+        auditors = data['auditors']
+        stores = data['stores']
+
+        print(f"📊 Processing: {len(auditors)} auditors, {len(stores)} stores")
+        print(f"⚠️  RULE: One auditor → One store only (1:1 mapping)")
+
+        # Perform assignment (will auto-fallback to greedy if AI fails)
+        assignments = perform_assignment(auditors, stores, use_ai=True)
+
+        # Format response
         response = format_spring_boot_response(auditors, stores, assignments)
+
+        print("=" * 60)
+        print("📤 SENDING RESPONSE")
+        print(f"✅ {response['message']}")
+        print("=" * 60)
+
         return jsonify(response), 200
 
     except Exception as e:
+        print("=" * 60)
+        print("❌ ERROR OCCURRED")
+        print("=" * 60)
+        print(f"Error: {str(e)}")
+        print(traceback.format_exc())
+        print("=" * 60)
+
         return jsonify({
             "status": "error",
+            "code": "PROCESSING_ERROR",
             "message": str(e),
             "details": traceback.format_exc()
         }), 500
 
-
 @app.route('/health', methods=['GET'])
-def health():
+def health_check():
+    """Health check endpoint"""
     return jsonify({
         "status": "healthy",
+        "service": "auditor-assignment-ai",
+        "assignment_rule": "One auditor → One store only",
         "ai_enabled": client is not None,
+        "ai_status": "available" if client else f"unavailable: {openai_error}",
         "timestamp": datetime.now().isoformat()
-    })
-
+    }), 200
 
 @app.route('/', methods=['GET'])
 def index():
+    """Root endpoint"""
     return jsonify({
-        "service": "AI Auditor Assignment",
-        "version": "1.0.0",
-        "ai_enabled": client is not None
-    })
-
+        "service": "AI-Powered Auditor Assignment Service",
+        "version": "2.1.0",
+        "assignment_rule": "⚠️ One auditor can only be assigned to ONE store",
+        "endpoints": {
+            "POST /api/process-assignments": "Main assignment endpoint",
+            "GET /health": "Health check",
+            "GET /": "Service information"
+        },
+        "ai_status": "enabled" if client else f"disabled: {openai_error}",
+        "fallback": "greedy algorithm (always available)",
+        "model": "gpt-3.5-turbo"
+    }), 200
 
 # ==================== MAIN ====================
 
-if __name__ == "__main__":
-    print("🚀 Auditor Assignment Service Running at http://localhost:5000")
-    app.run(host="0.0.0.0", port=5000, debug=True)
+if __name__ == '__main__':
+    print("=" * 60)
+    print("🚀 AI AUDITOR ASSIGNMENT SERVICE v2.1")
+    print("=" * 60)
+    print(f"⚠️  RULE: One Auditor → One Store Only (1:1 Mapping)")
+    print(f"OpenAI: {'✅ Available' if client else f'❌ Unavailable ({openai_error})'}")
+    print(f"Fallback: ✅ Greedy Algorithm (Always Available)")
+    print(f"Server: http://localhost:5000")
+    print(f"Endpoint: POST /api/process-assignments")
+    print("=" * 60)
+    print()
+
+    app.run(host='0.0.0.0', port=5000, debug=True)
