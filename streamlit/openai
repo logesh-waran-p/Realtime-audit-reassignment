@@ -11,39 +11,54 @@ from datetime import datetime
 app = Flask(__name__)
 app.config['JSON_SORT_KEYS'] = False
 
-# ---------------------------------------------------------
-# 👇 UPDATE THESE 3 VARIABLES FOR YOUR AZURE SETUP
-# ---------------------------------------------------------
-AZURE_OPENAI_API_KEY = "YOUR_FULL_KEY_HERE"  # <--- Paste full key here
-AZURE_ENDPOINT = "https://mobpochack25-openai-28.openai.azure.com/"
-AZURE_DEPLOYMENT_NAME = "gpt-4" # <--- CHECK YOUR AZURE PORTAL FOR MODEL NAME (e.g. "gpt-4", "gpt-35-turbo")
-AZURE_API_VERSION = "2024-02-15-preview"
-# ---------------------------------------------------------
+# ------------------------------------------------------------------
+# 👇 STEP 1: PASTE YOUR AZURE DETAILS HERE (REPLACE THE TEXT)
+# ------------------------------------------------------------------
 
-# Initialize Azure OpenAI client
+# 1. The key you said starts with a specific code:
+AZURE_OPENAI_API_KEY = "PASTE_YOUR_FULL_KEY_HERE"
+
+# 2. Your specific Endpoint (Do not change this):
+AZURE_ENDPOINT = "https://mobpochack25-openai-28.openai.azure.com/"
+
+# 3. Your Deployment Name from Azure Portal (e.g., "gpt-4", "gpt-35-turbo", "my-model"):
+# ⚠️ If this is wrong, you will get a 404 Error.
+AZURE_DEPLOYMENT_NAME = "gpt-4" 
+
+# 4. API Version (Usually doesn't need changing):
+AZURE_API_VERSION = "2024-02-15-preview"
+
+# ------------------------------------------------------------------
+
+# Initialize Azure OpenAI Client
 client = None
-if AZURE_OPENAI_API_KEY and "YOUR_" not in AZURE_OPENAI_API_KEY:
-    try:
+print("-" * 60)
+print(f"🔧 Configured Endpoint: {AZURE_ENDPOINT}")
+print(f"🔧 Configured Model: {AZURE_DEPLOYMENT_NAME}")
+
+try:
+    if "PASTE_YOUR" in AZURE_OPENAI_API_KEY:
+        print("⚠️ WARNING: You have not pasted your API Key in the code yet.")
+        print("   Ai features will be DISABLED until you edit lines 16-20.")
+    else:
         client = AzureOpenAI(
             azure_endpoint=AZURE_ENDPOINT,
             api_key=AZURE_OPENAI_API_KEY,
             api_version=AZURE_API_VERSION
         )
-        print(f"✅ Azure OpenAI Client Initialized: {AZURE_ENDPOINT}")
-    except Exception as e:
-        print(f"⚠️ Failed to initialize Azure Client: {e}")
-else:
-    print("⚠️ WARNING: API Key or Deployment Name not set in code variables.")
+        print("✅ Azure OpenAI Client Initialized Successfully!")
+except Exception as e:
+    print(f"❌ Failed to initialize Client: {e}")
+print("-" * 60)
 
 # Constants
 AUDITOR_CAPACITY_HOURS = 40.0
 HOURS_PER_STORE_AUDIT = 4.0
-MAX_STORES_PER_AUDITOR = 1
 
 # ==================== UTILITY FUNCTIONS ====================
 
 def calculate_distance(lat1, lon1, lat2, lon2):
-    R = 6371  # Earth's radius in kilometers
+    R = 6371  # Earth radius km
     dlat = math.radians(lat2 - lat1)
     dlon = math.radians(lon2 - lon1)
     a = (math.sin(dlat / 2) ** 2 + 
@@ -55,17 +70,15 @@ def calculate_distance(lat1, lon1, lat2, lon2):
 def validate_request_data(data):
     if not data: return False, "Request body is empty"
     if 'auditors' not in data or 'stores' not in data: return False, "Missing auditors or stores"
-    if not isinstance(data['auditors'], list) or not isinstance(data['stores'], list): return False, "Fields must be lists"
+    if not isinstance(data['auditors'], list): return False, "Auditors must be a list"
     return True, None
 
 def extract_json_from_text(text):
-    """
-    Robustly extract JSON object from string even if it contains markdown or garbage.
-    """
+    """Safely extracts JSON even if AI replies with Markdown."""
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Regex to find the outer-most JSON object { ... }
+        # Regex to find { ... }
         match = re.search(r'\{.*\}', text, re.DOTALL)
         if match:
             try:
@@ -74,251 +87,203 @@ def extract_json_from_text(text):
                 pass
     return None
 
-# ==================== ASSIGNMENT ALGORITHMS ====================
+# ==================== LOGIC ====================
 
 def assign_with_openai(auditors, stores):
     """
-    Use Azure OpenAI to intelligently assign auditors to stores.
+    Tries to use Azure OpenAI for assignments.
     """
     if not client:
-        raise Exception("Azure OpenAI client not initialized")
+        raise Exception("Client not active")
 
-    # Simplify data for the prompt to save tokens and improve accuracy
-    simplified_auditors = [
-        {"id": a['auditor_id'], "lat": round(a['latitude'], 4), "lon": round(a['longitude'], 4), "status": a['availability_status']} 
-        for a in auditors
-    ]
-    simplified_stores = [
-        {"id": s['store_id'], "lat": round(s['latitude'], 4), "lon": round(s['longitude'], 4)} 
-        for s in stores
-    ]
+    # Simplify data
+    simple_auditors = [{"id": a['auditor_id'], "lat": a['latitude'], "lon": a['longitude'], "status": a['availability_status']} for a in auditors]
+    simple_stores = [{"id": s['store_id'], "lat": s['latitude'], "lon": s['longitude']} for s in stores]
 
-    # Detailed system instruction
     prompt = f"""
-    Context: Field Logistics.
-    Task: Assign Auditors to Stores.
-    Constraint: ONE Auditor can visit strictly ONE Store (1:1).
-    Goal: Minimize total travel distance. 
-    Rule: Auditors with status "Available" only.
-    
-    Data:
-    AUDITORS: {json.dumps(simplified_auditors)}
-    STORES: {json.dumps(simplified_stores)}
-    
-    Respond strictly with this JSON format (no markdown):
+    Context: Logistics.
+    Task: Assign 1 Auditor to 1 Store (1:1 mapping).
+    Goal: Minimize total travel distance.
+    Only use Auditors with status "Available".
+
+    Input Data:
+    AUDITORS: {json.dumps(simple_auditors)}
+    STORES: {json.dumps(simple_stores)}
+
+    Output strictly this JSON structure:
     {{
       "assignments": [
-        {{"store_id": 1, "assigned_auditor_id": 2, "distance_km": 15.3, "reason": "Nearest available"}},
-        {{"store_id": 3, "assigned_auditor_id": null, "distance_km": null, "reason": "No auditors left"}}
+        {{"store_id": 101, "assigned_auditor_id": 202, "distance_km": 12.5, "reason": "Nearest"}},
+        {{"store_id": 102, "assigned_auditor_id": null, "distance_km": null, "reason": "No capacity"}}
       ]
     }}
     """
 
-    try:
-        print("📡 Calling Azure OpenAI API...")
+    print("📡 Calling Azure AI...")
+    response = client.chat.completions.create(
+        model=AZURE_DEPLOYMENT_NAME,
+        messages=[
+            {"role": "system", "content": "You are a raw JSON API. Do not output markdown."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.0
+    )
+
+    result_text = response.choices[0].message.content
+    data = extract_json_from_text(result_text)
+    
+    if not data or 'assignments' not in data:
+        raise Exception("Invalid JSON received from AI")
         
-        response = client.chat.completions.create(
-            model=AZURE_DEPLOYMENT_NAME, # This must match your Azure Deployment Name
-            messages=[
-                {"role": "system", "content": "You are a JSON-only API. You must output raw JSON. Do not write '```json'."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1, # Keep strict
-            # Note: response_format={"type": "json_object"} requires newer Azure API versions. 
-            # If you get an error here, remove this line.
-            response_format={"type": "json_object"} 
-        )
-
-        content = response.choices[0].message.content
-        result = extract_json_from_text(content)
-
-        if not result or 'assignments' not in result:
-            raise Exception("AI returned invalid JSON structure")
-
-        # ---------------- VALIDATION & CLEANUP ----------------
-        # Enforce 1:1 constraints and clean data locally
-        valid_assignments = []
-        assigned_auditors = set()
+    print("✅ AI responded successfully.")
+    
+    # Simple Conflict Check (Ensure 1:1 in case AI Hallucinated)
+    valid_assignments = []
+    seen_auditors = set()
+    
+    for item in data['assignments']:
+        aud_id = item.get('assigned_auditor_id')
+        if aud_id and aud_id in seen_auditors:
+            item['assigned_auditor_id'] = None
+            item['reason'] = "Conflict resolved locally"
         
-        # Priority check: ensure response is valid list
-        raw_list = result.get('assignments', [])
+        if item.get('assigned_auditor_id'):
+            seen_auditors.add(aud_id)
         
-        for assignment in raw_list:
-            store_id = assignment.get('store_id')
-            auditor_id = assignment.get('assigned_auditor_id')
+        valid_assignments.append(item)
+        
+    return {"assignments": valid_assignments}
 
-            if store_id is None: 
-                continue # Skip broken entries
-
-            # Ensure auditor not already assigned
-            if auditor_id is not None:
-                if auditor_id in assigned_auditors:
-                    print(f"⚠️ Conflict fix: Auditor {auditor_id} used twice. Unassigning from Store {store_id}.")
-                    assignment['assigned_auditor_id'] = None
-                    assignment['distance_km'] = None
-                    assignment['reason'] = "Conflict: Auditor already assigned"
-                else:
-                    assigned_auditors.add(auditor_id)
-            
-            valid_assignments.append(assignment)
-            
-        result['assignments'] = valid_assignments
-        print(f"✅ AI Assignment Completed")
-        return result
-
-    except OpenAIError as e:
-        print(f"❌ Azure OpenAI API Error: {str(e)}")
-        raise # Reraise to trigger greedy fallback
-    except Exception as e:
-        print(f"❌ General Error during AI processing: {str(e)}")
-        raise
-
-def assign_with_greedy_algorithm(auditors, stores):
+def assign_with_greedy(auditors, stores):
     """
-    Fallback: Simple greedy algorithm based on distance.
+    Fallback if AI fails.
     """
-    print("🔄 FALLBACK: Using Greedy Distance Algorithm")
+    print("🔄 Running Fallback Algorithm...")
     assignments = []
     assigned_auditors = set()
     
-    # 1. Calculate all possible pairs (Store, Auditor, Distance)
-    possibilities = []
+    available = [a for a in auditors if a['availability_status'] == 'Available']
     
-    available_auditors = [a for a in auditors if a['availability_status'] == 'Available']
-    
-    for store in stores:
-        for auditor in available_auditors:
-            dist = calculate_distance(store['latitude'], store['longitude'], auditor['latitude'], auditor['longitude'])
-            possibilities.append({
-                "store_id": store['store_id'],
-                "auditor_id": auditor['auditor_id'],
-                "dist": dist
-            })
-
-    # 2. Sort by smallest distance first (Greedy approach)
-    possibilities.sort(key=lambda x: x['dist'])
-
-    store_status = {s['store_id']: None for s in stores} # None = Unassigned
-
-    # 3. Assign
-    for p in possibilities:
-        s_id = p['store_id']
-        a_id = p['auditor_id']
-        
-        # If store needs assignment AND auditor is free
-        if store_status[s_id] is None and a_id not in assigned_auditors:
-            store_status[s_id] = {
-                "store_id": s_id,
-                "assigned_auditor_id": a_id,
-                "distance_km": round(p['dist'], 2),
-                "reason": "Greedy Nearest"
-            }
-            assigned_auditors.add(a_id)
-
-    # 4. Fill in unassigned stores
-    final_list = []
+    # Calculate all distances
+    all_options = []
     for s in stores:
-        s_id = s['store_id']
-        if store_status[s_id]:
-            final_list.append(store_status[s_id])
-        else:
+        for a in available:
+            d = calculate_distance(s['latitude'], s['longitude'], a['latitude'], a['longitude'])
+            all_options.append({
+                "store_id": s['store_id'],
+                "auditor_id": a['auditor_id'],
+                "dist": d
+            })
+            
+    # Sort by shortest distance
+    all_options.sort(key=lambda x: x['dist'])
+    
+    assigned_stores = set()
+    
+    final_list = []
+    
+    # First pass: optimal matches
+    for opt in all_options:
+        s_id = opt['store_id']
+        a_id = opt['auditor_id']
+        
+        if s_id not in assigned_stores and a_id not in assigned_auditors:
             final_list.append({
                 "store_id": s_id,
+                "assigned_auditor_id": a_id,
+                "distance_km": round(opt['dist'], 2),
+                "reason": "Nearest greedy match"
+            })
+            assigned_stores.add(s_id)
+            assigned_auditors.add(a_id)
+
+    # Second pass: fill unassigned stores as NULL
+    for s in stores:
+        if s['store_id'] not in assigned_stores:
+            final_list.append({
+                "store_id": s['store_id'],
                 "assigned_auditor_id": None,
                 "distance_km": None,
-                "reason": "No auditors available"
+                "reason": "No available auditors"
             })
-
+            
     return {"assignments": final_list}
 
-def perform_assignment(auditors, stores):
-    """
-    Try AI, fallback to Greedy if any error occurs.
-    """
-    if client:
-        try:
-            return assign_with_openai(auditors, stores)
-        except Exception as e:
-            print(f"⚠️ Falling back to algorithm due to error: {e}")
-            
-    return assign_with_greedy_algorithm(auditors, stores)
+def format_final_response(auditors, stores, assignment_data):
+    # Convert assignments list to a Map for easy lookup
+    # Map[Store_ID] = Auditor_ID
+    map_s_to_a = {a['store_id']: a.get('assigned_auditor_id') for a in assignment_data['assignments']}
 
-# ==================== ENDPOINT HANDLERS ====================
-
-def format_response(auditors, stores, assignment_result):
-    # Lookup map
-    ass_map = {x['store_id']: x.get('assigned_auditor_id') for x in assignment_result['assignments']}
-    
-    # Format Auditors response
-    res_auditors = []
+    formatted_auditors = []
     for aud in auditors:
-        # Check if this auditor was used in the map
-        assigned_store = next((s_id for s_id, a_id in ass_map.items() if a_id == aud['auditor_id']), None)
+        # Find which store is assigned to this auditor
+        assigned_store_id = next((s_id for s_id, a_id in map_s_to_a.items() if a_id == aud['auditor_id']), None)
         
-        current_hours = HOURS_PER_STORE_AUDIT if assigned_store else 0
+        hours = HOURS_PER_STORE_AUDIT if assigned_store_id else 0
         
-        res_auditors.append({
+        formatted_auditors.append({
             "auditor_id": aud['auditor_id'],
             "latitude": aud['latitude'],
             "longitude": aud['longitude'],
             "availability_status": aud['availability_status'],
-            "workloadCapacityHours": AUDITOR_CAPACITY_HOURS,
-            "currentAssignedHours": current_hours,
-            "remaining_hours": AUDITOR_CAPACITY_HOURS - current_hours,
-            "assigned_store_ids": [assigned_store] if assigned_store else []
+            "currentAssignedHours": hours,
+            "assigned_store_ids": [assigned_store_id] if assigned_store_id else []
         })
 
-    # Format Stores response
-    res_stores = []
+    formatted_stores = []
     for store in stores:
-        res_stores.append({
+        formatted_stores.append({
             "store_id": store['store_id'],
             "latitude": store['latitude'],
             "longitude": store['longitude'],
-            "store_status": store['store_status'],
-            "assigned_auditor_id": ass_map.get(store['store_id'])
+            "assigned_auditor_id": map_s_to_a.get(store['store_id'])
         })
 
     return {
         "status": "success",
-        "message": f"Assigned via {'Azure AI' if client else 'Fallback Logic'}",
+        "mode": "AI" if client and "PASTE" not in AZURE_OPENAI_API_KEY else "Algorithm",
         "data": {
-            "auditors": res_auditors,
-            "stores": res_stores
+            "auditors": formatted_auditors,
+            "stores": formatted_stores
         }
     }
 
-@app.route('/api/process-assignments', methods=['POST'])
-def handle_assignments():
-    try:
-        print("\n📥 New Request Received")
-        data = request.get_json()
-        
-        valid, msg = validate_request_data(data)
-        if not valid:
-            return jsonify({"status": "error", "message": msg}), 400
+# ==================== ENDPOINTS ====================
 
-        result = perform_assignment(data['auditors'], data['stores'])
-        response = format_response(data['auditors'], data['stores'], result)
+@app.route('/api/process-assignments', methods=['POST'])
+def process():
+    try:
+        data = request.get_json()
+        is_valid, error = validate_request_data(data)
+        if not is_valid:
+            return jsonify({"status": "error", "message": error}), 400
+
+        # Step 1: Try AI
+        result = None
+        if client:
+            try:
+                result = assign_with_openai(data['auditors'], data['stores'])
+            except Exception as e:
+                print(f"⚠️ AI Failed ({str(e)}), switching to Fallback.")
         
-        print("📤 Sending Response\n")
-        return jsonify(response)
+        # Step 2: Use Fallback if AI failed or client not set
+        if not result:
+            result = assign_with_greedy(data['auditors'], data['stores'])
+
+        # Step 3: Format and Send
+        return jsonify(format_final_response(data['auditors'], data['stores'], result))
 
     except Exception as e:
-        print("❌ Critical Server Error")
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({
-        "status": "up",
-        "provider": "Azure OpenAI",
-        "endpoint": AZURE_ENDPOINT,
-        "connected": client is not None
+        "status": "active", 
+        "azure_connected": client is not None
     })
 
-# ==================== MAIN ====================
 if __name__ == '__main__':
-    print(f"🚀 Azure AI Service Started on Port 5000")
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    print("🚀 Server starting...")
+    app.run(host='0.0.0.0', port=5000)
